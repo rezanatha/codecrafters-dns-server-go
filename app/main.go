@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 )
 
 type DNSHeader struct {
@@ -22,16 +23,55 @@ type DNSHeader struct {
 	ARCOUNT uint16 //(16 bits) Additional Record Count : Number of records in the Additional section
 }
 
-func (header DNSHeader) serialize() []byte {
+type DNSQuestion struct {
+	QNAME  string
+	QTYPE  uint16
+	QCLASS uint16
+}
+
+type DNSMessage struct {
+	Header   DNSHeader
+	Question DNSQuestion
+}
+
+func (h *DNSHeader) Serialize() []byte {
 	buffer := make([]byte, 12)
-	binary.BigEndian.PutUint16(buffer[0:2], header.ID)
-	buffer[2] = header.QR<<7 | header.OPCODE<<3 | header.AA<<2 | header.TC<<1 | header.RD
-	buffer[3] = header.RA<<7 | header.Z<<4 | header.RCODE
-	binary.BigEndian.PutUint16(buffer[4:6], header.QDCOUNT)
-	binary.BigEndian.PutUint16(buffer[6:8], header.ANCOUNT)
-	binary.BigEndian.PutUint16(buffer[8:10], header.NSCOUNT)
-	binary.BigEndian.PutUint16(buffer[10:12], header.ARCOUNT)
+	binary.BigEndian.PutUint16(buffer[0:2], h.ID)
+	buffer[2] = h.QR<<7 | h.OPCODE<<3 | h.AA<<2 | h.TC<<1 | h.RD
+	buffer[3] = h.RA<<7 | h.Z<<4 | h.RCODE
+	binary.BigEndian.PutUint16(buffer[4:6], h.QDCOUNT)
+	binary.BigEndian.PutUint16(buffer[6:8], h.ANCOUNT)
+	binary.BigEndian.PutUint16(buffer[8:10], h.NSCOUNT)
+	binary.BigEndian.PutUint16(buffer[10:12], h.ARCOUNT)
 	return buffer
+}
+
+func (q *DNSQuestion) SerializeName() []byte {
+	labels := strings.Split(q.QNAME, ".")
+	data := []byte{}
+
+	for _, label := range labels {
+		data = append(data, byte(len(label)))
+		data = append(data, label...)
+	}
+
+	data = append(data, '\x00')
+	return data
+}
+
+func (q *DNSQuestion) Serialize() []byte {
+	labels := q.SerializeName()
+	size := len(labels) + 4
+	bytes := make([]byte, size)
+
+	copy(bytes, labels)
+
+	bytes[size-4] = byte(q.QTYPE >> 8)
+	bytes[size-3] = byte(q.QTYPE)
+	bytes[size-2] = byte(q.QCLASS >> 8)
+	bytes[size-1] = byte(q.QCLASS)
+
+	return bytes
 }
 
 func main() {
@@ -66,8 +106,8 @@ func main() {
 		// Create an empty response
 		//response := []byte{}
 
-		// Create default header
-		defaultHeader := DNSHeader{
+		// Create example header & question
+		exampleHeader := DNSHeader{
 			ID:      1234,
 			QR:      1,
 			OPCODE:  0,
@@ -77,12 +117,21 @@ func main() {
 			RA:      0,
 			Z:       0,
 			RCODE:   0,
-			QDCOUNT: 0,
+			QDCOUNT: 1,
 			ANCOUNT: 0,
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
-		response := defaultHeader.serialize()
+		exampleQuestion := DNSQuestion{
+			QNAME:  "codecrafters.io",
+			QTYPE:  1,
+			QCLASS: 1,
+		}
+		var response []byte
+		response = append(response, exampleHeader.Serialize()...)
+		response = append(response, exampleQuestion.Serialize()...)
+
+		//response := exampleHeader.Serialize()
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
