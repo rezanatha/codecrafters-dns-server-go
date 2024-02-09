@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -29,9 +30,19 @@ type DNSQuestion struct {
 	QCLASS uint16
 }
 
+type DNSAnswer struct {
+	NAME     string
+	TYPE     uint16
+	CLASS    uint16
+	TTL      uint32
+	RDLENGTH uint16
+	RDATA    []byte
+}
+
 type DNSMessage struct {
 	Header   DNSHeader
 	Question DNSQuestion
+	Answer   DNSAnswer
 }
 
 func (h *DNSHeader) Serialize() []byte {
@@ -59,6 +70,20 @@ func (q *DNSQuestion) SerializeName() []byte {
 	return data
 }
 
+func SerializeDNSName(name string) ([]byte, error) {
+	labels := strings.Split(name, ".")
+	data := []byte{}
+
+	for _, label := range labels {
+		data = append(data, byte(len(label)))
+		data = append(data, label...)
+	}
+
+	data = append(data, '\x00')
+	return data, nil
+
+}
+
 func (q *DNSQuestion) Serialize() []byte {
 	labels := q.SerializeName()
 	size := len(labels) + 4
@@ -72,6 +97,44 @@ func (q *DNSQuestion) Serialize() []byte {
 	bytes[size-1] = byte(q.QCLASS)
 
 	return bytes
+}
+
+func (a *DNSAnswer) Serialize() ([]byte, error) {
+	var buf bytes.Buffer
+	name, _ := SerializeDNSName(a.NAME)
+	buf.Write(name)
+	err := binary.Write(&buf, binary.BigEndian, a.TYPE)
+	if err != nil {
+		return nil, fmt.Errorf("unable to write answer TYPE: %w", err)
+	}
+	err = binary.Write(&buf, binary.BigEndian, a.CLASS)
+	if err != nil {
+		return nil, fmt.Errorf("unable to write answer CLASS: %w", err)
+	}
+	err = binary.Write(&buf, binary.BigEndian, a.TTL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to write answer TTL: %w", err)
+	}
+	err = binary.Write(&buf, binary.BigEndian, a.RDLENGTH)
+	if err != nil {
+		return nil, fmt.Errorf("unable to write answer RDLENGTH: %w", err)
+	}
+
+	buf.Write(a.RDATA)
+	return buf.Bytes(), nil
+}
+
+func (a *DNSMessage) Serialize() ([]byte, error) {
+	data := []byte{}
+	data = append(data, a.Header.Serialize()...)
+	data = append(data, a.Question.Serialize()...)
+	answer, err := a.Answer.Serialize()
+	if err != nil {
+		return nil, fmt.Errorf("unable to write answer %w", err)
+	}
+	data = append(data, answer...)
+
+	return data, nil
 }
 
 func main() {
@@ -106,7 +169,22 @@ func main() {
 		// Create an empty response
 		//response := []byte{}
 
-		// Create example header & question
+		// Create example header with question & answer
+		exampleQuestion := DNSQuestion{
+			QNAME:  "codecrafters.io",
+			QTYPE:  1,
+			QCLASS: 1,
+		}
+
+		exampleAnswer := DNSAnswer{
+			NAME:     exampleQuestion.QNAME,
+			TYPE:     1,
+			CLASS:    1,
+			TTL:      60,
+			RDLENGTH: 4,
+			RDATA:    []byte{8, 8, 8, 8},
+		}
+
 		exampleHeader := DNSHeader{
 			ID:      1234,
 			QR:      1,
@@ -118,20 +196,21 @@ func main() {
 			Z:       0,
 			RCODE:   0,
 			QDCOUNT: 1,
-			ANCOUNT: 0,
+			ANCOUNT: 1,
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
-		exampleQuestion := DNSQuestion{
-			QNAME:  "codecrafters.io",
-			QTYPE:  1,
-			QCLASS: 1,
-		}
-		var response []byte
-		response = append(response, exampleHeader.Serialize()...)
-		response = append(response, exampleQuestion.Serialize()...)
 
-		//response := exampleHeader.Serialize()
+		exampleMessage := DNSMessage{
+			Header:   exampleHeader,
+			Question: exampleQuestion,
+			Answer:   exampleAnswer,
+		}
+
+		response, err := exampleMessage.Serialize()
+		if err != nil {
+			fmt.Println("Failed to serialize message: ", err)
+		}
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
