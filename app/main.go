@@ -45,18 +45,6 @@ type DNSMessage struct {
 	Answer   DNSAnswer
 }
 
-func (h *DNSHeader) Serialize() []byte {
-	buffer := make([]byte, 12)
-	binary.BigEndian.PutUint16(buffer[0:2], h.ID)
-	buffer[2] = h.QR<<7 | h.OPCODE<<3 | h.AA<<2 | h.TC<<1 | h.RD
-	buffer[3] = h.RA<<7 | h.Z<<4 | h.RCODE
-	binary.BigEndian.PutUint16(buffer[4:6], h.QDCOUNT)
-	binary.BigEndian.PutUint16(buffer[6:8], h.ANCOUNT)
-	binary.BigEndian.PutUint16(buffer[8:10], h.NSCOUNT)
-	binary.BigEndian.PutUint16(buffer[10:12], h.ARCOUNT)
-	return buffer
-}
-
 func (q *DNSQuestion) SerializeName() []byte {
 	labels := strings.Split(q.QNAME, ".")
 	data := []byte{}
@@ -124,6 +112,18 @@ func (a *DNSAnswer) Serialize() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func (h *DNSHeader) Serialize() []byte {
+	buffer := make([]byte, 12)
+	binary.BigEndian.PutUint16(buffer[0:2], h.ID)
+	buffer[2] = h.QR<<7 | h.OPCODE<<3 | h.AA<<2 | h.TC<<1 | h.RD
+	buffer[3] = h.RA<<7 | h.Z<<4 | h.RCODE
+	binary.BigEndian.PutUint16(buffer[4:6], h.QDCOUNT)
+	binary.BigEndian.PutUint16(buffer[6:8], h.ANCOUNT)
+	binary.BigEndian.PutUint16(buffer[8:10], h.NSCOUNT)
+	binary.BigEndian.PutUint16(buffer[10:12], h.ARCOUNT)
+	return buffer
+}
+
 func (a *DNSMessage) Serialize() ([]byte, error) {
 	data := []byte{}
 	data = append(data, a.Header.Serialize()...)
@@ -135,6 +135,46 @@ func (a *DNSMessage) Serialize() ([]byte, error) {
 	data = append(data, answer...)
 
 	return data, nil
+}
+
+func ParseDNSHeader(r *bytes.Reader) (DNSHeader, error) {
+	h := DNSHeader{}
+	//Read ID (2 bytes)
+	binary.Read(r, binary.BigEndian, &h.ID)
+	//Read QR, OPCODE, AA, TC, RD (1 byte)
+	thirdByteFlags, err := r.ReadByte()
+	if err != nil {
+		return h, fmt.Errorf("error reading DNS header on 3rd byte %w", err)
+	}
+	h.QR = thirdByteFlags >> 7
+	h.OPCODE = (thirdByteFlags >> 3) & 0xF
+	h.AA = thirdByteFlags & 0x4
+	h.TC = thirdByteFlags & 0x2
+	h.RD = thirdByteFlags & 0x1
+
+	//Read RA, RCODE (1 byte)
+	fourthByteFlags, err := r.ReadByte()
+	if err != nil {
+		return h, fmt.Errorf("error reading DNS header on 4th byte %w", err)
+	}
+	h.RA = fourthByteFlags >> 7
+	h.RCODE = fourthByteFlags & 0xF
+
+	return h, nil
+}
+
+func ParseDNSMessage(buf []byte) (DNSMessage, error) {
+	reader := bytes.NewReader(buf)
+	header, err := ParseDNSHeader(reader)
+	//TODO: parse incoming question
+
+	if err != nil {
+		fmt.Println("Error reading DNS message, returning empty message ", err)
+		return DNSMessage{}, err
+	}
+	return DNSMessage{
+		Header: header,
+	}, nil
 }
 
 func main() {
@@ -157,6 +197,7 @@ func main() {
 	buf := make([]byte, 512)
 
 	for {
+		// Read from incoming DNS packets
 		size, source, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Error receiving data:", err)
@@ -166,10 +207,13 @@ func main() {
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 
-		// Create an empty response
-		//response := []byte{}
+		parsedData, err := ParseDNSMessage(buf[:size])
+		if err != nil {
+			fmt.Println("error while parsing DNS message ", err)
+			continue
+		}
 
-		// Create example header with question & answer
+		// Create example header with question & answer for response
 		exampleQuestion := DNSQuestion{
 			QNAME:  "codecrafters.io",
 			QTYPE:  1,
@@ -185,16 +229,23 @@ func main() {
 			RDATA:    []byte{8, 8, 8, 8},
 		}
 
+		if parsedData.Header.OPCODE == 0 {
+			parsedData.Header.RCODE = 0
+		} else {
+			parsedData.Header.RCODE = 4
+
+		}
+
 		exampleHeader := DNSHeader{
-			ID:      1234,
+			ID:      parsedData.Header.ID,
 			QR:      1,
-			OPCODE:  0,
+			OPCODE:  parsedData.Header.OPCODE,
 			AA:      0,
 			TC:      0,
-			RD:      0,
+			RD:      parsedData.Header.RD,
 			RA:      0,
 			Z:       0,
-			RCODE:   0,
+			RCODE:   parsedData.Header.RCODE,
 			QDCOUNT: 1,
 			ANCOUNT: 1,
 			NSCOUNT: 0,
@@ -207,12 +258,12 @@ func main() {
 			Answer:   exampleAnswer,
 		}
 
-		response, err := exampleMessage.Serialize()
+		receivedMessage, err := exampleMessage.Serialize()
 		if err != nil {
 			fmt.Println("Failed to serialize message: ", err)
 		}
 
-		_, err = udpConn.WriteToUDP(response, source)
+		_, err = udpConn.WriteToUDP(receivedMessage, source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
