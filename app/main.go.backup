@@ -169,6 +169,11 @@ func ParseDNSHeader(r *bytes.Reader) (DNSHeader, error) {
 
 func ParseDNSName(r *bytes.Reader) (string, error) {
 	var name []string
+	// var followCompressed bool = false
+	// var finalOffset int64
+	// var originalOffset int64
+
+	// originalOffset, _ = r.Seek(0, io.SeekCurrent)
 	for {
 		var length byte
 		err := binary.Read(r, binary.BigEndian, &length)
@@ -178,7 +183,10 @@ func ParseDNSName(r *bytes.Reader) (string, error) {
 		if length == 0 {
 			break
 		} else if length&0xC0 == 0xC0 {
-
+			// if !followCompressed {
+			// 	finalOffset, _ = r.Seek(0, io.SeekCurrent)
+			// 	followCompressed = true
+			// }
 			var secondByteOffset byte
 			err := binary.Read(r, binary.BigEndian, &secondByteOffset)
 			if err != nil {
@@ -193,9 +201,17 @@ func ParseDNSName(r *bytes.Reader) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("error reading DNS question name label %w", err)
 			}
+
 			name = append(name, string(labels))
+			// if followCompressed {
+			// 	r.Seek(finalOffset, io.SeekStart)
+			// 	break
+			// }
 		}
 	}
+	// if followCompressed {
+	// 	r.Seek(originalOffset, io.SeekStart)
+	// }
 
 	return strings.Join(name, "."), nil
 }
