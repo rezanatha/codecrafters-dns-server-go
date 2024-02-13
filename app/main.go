@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 )
@@ -41,21 +42,8 @@ type DNSAnswer struct {
 
 type DNSMessage struct {
 	Header   DNSHeader
-	Question DNSQuestion
-	Answer   DNSAnswer
-}
-
-func (q *DNSQuestion) SerializeName() []byte {
-	labels := strings.Split(q.QNAME, ".")
-	data := []byte{}
-
-	for _, label := range labels {
-		data = append(data, byte(len(label)))
-		data = append(data, label...)
-	}
-
-	data = append(data, '\x00')
-	return data
+	Question []DNSQuestion
+	Answer   []DNSAnswer
 }
 
 func SerializeDNSName(name string) ([]byte, error) {
@@ -73,7 +61,11 @@ func SerializeDNSName(name string) ([]byte, error) {
 }
 
 func (q *DNSQuestion) Serialize() []byte {
-	labels := q.SerializeName()
+	labels, err := SerializeDNSName(q.QNAME)
+	if err != nil {
+		fmt.Println("Error when serializing DNS question name: ", err)
+		return nil
+	}
 	size := len(labels) + 4
 	bytes := make([]byte, size)
 
@@ -124,16 +116,22 @@ func (h *DNSHeader) Serialize() []byte {
 	return buffer
 }
 
-func (a *DNSMessage) Serialize() ([]byte, error) {
+func (m *DNSMessage) Serialize() ([]byte, error) {
 	data := []byte{}
-	data = append(data, a.Header.Serialize()...)
-	data = append(data, a.Question.Serialize()...)
-	answer, err := a.Answer.Serialize()
-	if err != nil {
-		return nil, fmt.Errorf("unable to write answer %w", err)
-	}
-	data = append(data, answer...)
 
+	data = append(data, m.Header.Serialize()...)
+
+	for _, q := range m.Question {
+		data = append(data, q.Serialize()...)
+	}
+
+	for _, a := range m.Answer {
+		answer, err := a.Serialize()
+		if err != nil {
+			return nil, fmt.Errorf("unable to write answer %w", err)
+		}
+		data = append(data, answer...)
+	}
 	return data, nil
 }
 
@@ -147,10 +145,10 @@ func ParseDNSHeader(r *bytes.Reader) (DNSHeader, error) {
 		return h, fmt.Errorf("error reading DNS header on 3rd byte %w", err)
 	}
 	h.QR = thirdByteFlags >> 7
-	h.OPCODE = (thirdByteFlags >> 3) & 0xF
-	h.AA = thirdByteFlags & 0x4
-	h.TC = thirdByteFlags & 0x2
-	h.RD = thirdByteFlags & 0x1
+	h.OPCODE = (thirdByteFlags >> 3) & 0x0F
+	h.AA = (thirdByteFlags >> 2) & 0x01
+	h.TC = (thirdByteFlags >> 1) & 0x01
+	h.RD = thirdByteFlags & 0x01
 
 	//Read RA, RCODE (1 byte)
 	fourthByteFlags, err := r.ReadByte()
@@ -160,20 +158,125 @@ func ParseDNSHeader(r *bytes.Reader) (DNSHeader, error) {
 	h.RA = fourthByteFlags >> 7
 	h.RCODE = fourthByteFlags & 0xF
 
+	//Read QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT
+	binary.Read(r, binary.BigEndian, &h.QDCOUNT)
+	binary.Read(r, binary.BigEndian, &h.ANCOUNT)
+	binary.Read(r, binary.BigEndian, &h.NSCOUNT)
+	binary.Read(r, binary.BigEndian, &h.ARCOUNT)
+
 	return h, nil
 }
 
-func ParseDNSMessage(buf []byte) (DNSMessage, error) {
-	reader := bytes.NewReader(buf)
-	header, err := ParseDNSHeader(reader)
-	//TODO: parse incoming question
+func ParseDNSName(r *bytes.Reader) (string, error) {
+	var name string
+	var length byte
+	for {
+		err := binary.Read(r, binary.BigEndian, &length)
+		if err != nil {
+			return "", fmt.Errorf("error reading DNS question name length %w", err)
+		}
+		if length == 0 {
+			break
+		}
+		labels := make([]byte, length)
+		_, err = r.Read(labels)
+		if err != nil {
+			return "", fmt.Errorf("error reading DNS question name label %w", err)
+		}
+		if len(name) > 0 {
+			name += "."
+		}
+		name += string(labels)
+	}
+	return name, nil
+}
 
+func ParseDNSQuestion(r *bytes.Reader) (DNSQuestion, error) {
+	q := DNSQuestion{}
+	name, _ := ParseDNSName(r)
+	q.QNAME = name
+	binary.Read(r, binary.BigEndian, q.QTYPE)
+	binary.Read(r, binary.BigEndian, q.QCLASS)
+
+	return q, nil
+}
+
+func CreateDNSMessage(request *DNSMessage) (DNSMessage, error) {
+	response := DNSMessage{}
+	//process question
+	questions := []DNSQuestion{}
+	for i := 0; i < int(request.Header.QDCOUNT); i++ {
+		q := DNSQuestion{
+			QNAME:  request.Question[i].QNAME,
+			QTYPE:  1,
+			QCLASS: 1,
+		}
+		questions = append(questions, q)
+	}
+	response.Question = questions
+
+	//process answer
+	answers := []DNSAnswer{}
+	for i := 0; i < int(request.Header.QDCOUNT); i++ {
+		a := DNSAnswer{
+			NAME:     request.Question[i].QNAME,
+			TYPE:     1,
+			CLASS:    1,
+			TTL:      60,
+			RDLENGTH: 4,
+			RDATA:    []byte{8, 8, 8, 8},
+		}
+		answers = append(answers, a)
+	}
+	response.Answer = answers
+
+	//process header
+	if request.Header.OPCODE == 0 {
+		response.Header.RCODE = 0
+	} else {
+		response.Header.RCODE = 4
+	}
+
+	response.Header = DNSHeader{
+		ID:      request.Header.ID,
+		QR:      1,
+		OPCODE:  request.Header.OPCODE,
+		AA:      0,
+		TC:      0,
+		RD:      request.Header.RD,
+		RA:      0,
+		Z:       0,
+		RCODE:   response.Header.RCODE,
+		QDCOUNT: uint16(len(questions)),
+		ANCOUNT: uint16(len(answers)),
+		NSCOUNT: 0,
+		ARCOUNT: 0,
+	}
+
+	return response, nil
+}
+
+func ParseDNSMessage(r *bytes.Reader) (DNSMessage, error) {
+	header, err := ParseDNSHeader(r)
 	if err != nil {
 		fmt.Println("Error reading DNS message, returning empty message ", err)
 		return DNSMessage{}, err
 	}
+	//parse incoming question
+	_, _ = r.Seek(12, io.SeekStart)
+	questions := []DNSQuestion{}
+	for i := 0; i < int(header.QDCOUNT); i++ {
+		var q DNSQuestion
+		name, _ := ParseDNSName(r)
+		q.QNAME = name
+		binary.Read(r, binary.BigEndian, q.QTYPE)
+		binary.Read(r, binary.BigEndian, q.QCLASS)
+		questions = append(questions, q)
+	}
+
 	return DNSMessage{
-		Header: header,
+		Header:   header,
+		Question: questions,
 	}, nil
 }
 
@@ -207,55 +310,61 @@ func main() {
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 
-		parsedData, err := ParseDNSMessage(buf[:size])
+		dataReader := bytes.NewReader(buf[:size])
+		parsedData, err := ParseDNSMessage(dataReader)
 		if err != nil {
 			fmt.Println("error while parsing DNS message ", err)
 			continue
 		}
 
 		// Create example header with question & answer for response
-		exampleQuestion := DNSQuestion{
-			QNAME:  "codecrafters.io",
-			QTYPE:  1,
-			QCLASS: 1,
-		}
+		// exampleQuestion := []DNSQuestion{
+		// 	{QNAME: "codecrafters.io",
+		// 		QTYPE:  1,
+		// 		QCLASS: 1,
+		// 	}}
 
-		exampleAnswer := DNSAnswer{
-			NAME:     exampleQuestion.QNAME,
-			TYPE:     1,
-			CLASS:    1,
-			TTL:      60,
-			RDLENGTH: 4,
-			RDATA:    []byte{8, 8, 8, 8},
-		}
+		// exampleAnswer := []DNSAnswer{{
+		// 	NAME:     "codecrafters.io",
+		// 	TYPE:     1,
+		// 	CLASS:    1,
+		// 	TTL:      60,
+		// 	RDLENGTH: 4,
+		// 	RDATA:    []byte{8, 8, 8, 8},
+		// }}
 
-		if parsedData.Header.OPCODE == 0 {
-			parsedData.Header.RCODE = 0
-		} else {
-			parsedData.Header.RCODE = 4
+		// if parsedData.Header.OPCODE == 0 {
+		// 	parsedData.Header.RCODE = 0
+		// } else {
+		// 	parsedData.Header.RCODE = 4
 
-		}
+		// }
 
-		exampleHeader := DNSHeader{
-			ID:      parsedData.Header.ID,
-			QR:      1,
-			OPCODE:  parsedData.Header.OPCODE,
-			AA:      0,
-			TC:      0,
-			RD:      parsedData.Header.RD,
-			RA:      0,
-			Z:       0,
-			RCODE:   parsedData.Header.RCODE,
-			QDCOUNT: 1,
-			ANCOUNT: 1,
-			NSCOUNT: 0,
-			ARCOUNT: 0,
-		}
+		// exampleHeader := DNSHeader{
+		// 	ID:      parsedData.Header.ID,
+		// 	QR:      1,
+		// 	OPCODE:  parsedData.Header.OPCODE,
+		// 	AA:      0,
+		// 	TC:      0,
+		// 	RD:      parsedData.Header.RD,
+		// 	RA:      0,
+		// 	Z:       0,
+		// 	RCODE:   parsedData.Header.RCODE,
+		// 	QDCOUNT: 1,
+		// 	ANCOUNT: 1,
+		// 	NSCOUNT: 0,
+		// 	ARCOUNT: 0,
+		// }
 
-		exampleMessage := DNSMessage{
-			Header:   exampleHeader,
-			Question: exampleQuestion,
-			Answer:   exampleAnswer,
+		// exampleMessage := DNSMessage{
+		// 	Header:   exampleHeader,
+		// 	Question: exampleQuestion,
+		// 	Answer:   exampleAnswer,
+		// }
+
+		exampleMessage, err := CreateDNSMessage(&parsedData)
+		if err != nil {
+			fmt.Println("Failed to create DNS message: ", err)
 		}
 
 		receivedMessage, err := exampleMessage.Serialize()
