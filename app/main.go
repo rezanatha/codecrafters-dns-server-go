@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -57,7 +58,6 @@ func SerializeDNSName(name string) ([]byte, error) {
 
 	data = append(data, '\x00')
 	return data, nil
-
 }
 
 func (q *DNSQuestion) Serialize() []byte {
@@ -204,8 +204,8 @@ func ParseDNSQuestion(r *bytes.Reader) (DNSQuestion, error) {
 	q := DNSQuestion{}
 	name, _ := ParseDNSName(r)
 	q.QNAME = name
-	binary.Read(r, binary.BigEndian, q.QTYPE)
-	binary.Read(r, binary.BigEndian, q.QCLASS)
+	binary.Read(r, binary.BigEndian, &q.QTYPE)
+	binary.Read(r, binary.BigEndian, &q.QCLASS)
 
 	return q, nil
 }
@@ -217,24 +217,43 @@ func ParseDNSMessage(r *bytes.Reader) (DNSMessage, error) {
 		return DNSMessage{}, err
 	}
 	//parse incoming question
-	_, _ = r.Seek(12, io.SeekStart)
+	// _, _ = r.Seek(12, io.SeekStart)
 	questions := []DNSQuestion{}
 
 	for i := 0; i < int(header.QDCOUNT); i++ {
 		var q DNSQuestion
 		name, _ := ParseDNSName(r)
 		q.QNAME = name
-		binary.Read(r, binary.BigEndian, q.QTYPE)
-		binary.Read(r, binary.BigEndian, q.QCLASS)
+		binary.Read(r, binary.BigEndian, &q.QTYPE)
+		binary.Read(r, binary.BigEndian, &q.QCLASS)
 		questions = append(questions, q)
+	}
+
+	//parse incoming answer (is not empty if we parse a DNS response from a remote resolver)
+	answer := []DNSAnswer{}
+	for i := 0; i < int(header.ANCOUNT); i++ {
+		var a DNSAnswer
+		name, _ := ParseDNSName(r)
+		a.NAME = name
+		binary.Read(r, binary.BigEndian, &a.TYPE)
+		binary.Read(r, binary.BigEndian, &a.CLASS)
+		binary.Read(r, binary.BigEndian, &a.TTL)
+		binary.Read(r, binary.BigEndian, &a.RDLENGTH)
+
+		data := make([]byte, a.RDLENGTH)
+		binary.Read(r, binary.BigEndian, &data)
+		a.RDATA = data
+		answer = append(answer, a)
 	}
 
 	return DNSMessage{
 		Header:   header,
 		Question: questions,
+		Answer:   answer,
 	}, nil
 }
-func CreateDNSMessage(request *DNSMessage) (DNSMessage, error) {
+
+func CreateDummyDNSResponse(request *DNSMessage) (DNSMessage, error) {
 	response := DNSMessage{}
 	//process question
 	questions := []DNSQuestion{}
@@ -289,14 +308,102 @@ func CreateDNSMessage(request *DNSMessage) (DNSMessage, error) {
 	return response, nil
 }
 
+func ResolveQueryWithForwarder(remoteServerConn *net.UDPConn, requestMessage *DNSMessage) (DNSMessage, error) {
+	msgFromResolver := *requestMessage
+	msgFromResolver.Answer = make([]DNSAnswer, 0)
+	msgFromResolver.Header.ANCOUNT = 0
+
+	//get answer from remote DNS server
+	for i, q := range requestMessage.Question {
+		msgToResolver := requestMessage
+		msgToResolver.Answer = make([]DNSAnswer, 0)
+		msgToResolver.Question = make([]DNSQuestion, 1)
+		msgToResolver.Question[0] = q
+		msgToResolver.Header.QDCOUNT = 1
+		msgToResolver.Header.ID = requestMessage.Header.ID + uint16(i)
+		msgToResolver.Header.QR = 0
+
+		msg, err := msgToResolver.Serialize()
+		if err != nil {
+			fmt.Println("Error serializing DNS message to resolver: ", err)
+			return DNSMessage{}, err
+		}
+		_, err = remoteServerConn.Write(msg)
+		if err != nil {
+			fmt.Println("Error sending data to remote DNS resolver: ", err)
+			return DNSMessage{}, err
+		}
+		remoteBuf := make([]byte, 512)
+		remoteSize, err := remoteServerConn.Read(remoteBuf)
+
+		if err != nil {
+			fmt.Println("Error receiving data from remote DNS resolver: ", err)
+			return DNSMessage{}, err
+		}
+
+		d := bytes.NewReader(remoteBuf[:remoteSize])
+		msgParsed, err := ParseDNSMessage(d)
+		if err != nil {
+			fmt.Println("error while parsing DNS message from remote DNS resolver ", err)
+			return DNSMessage{}, err
+		}
+
+		fmt.Printf("Received %d bytes from resolver. [Q: %d ID: %d QDCOUNT: %d ANCOUNT: %d]\n",
+			remoteSize,
+			i,
+			msgParsed.Header.ID,
+			msgParsed.Header.QDCOUNT,
+			msgParsed.Header.ANCOUNT,
+		)
+		msgFromResolver.Answer = append(msgFromResolver.Answer, msgParsed.Answer...)
+	}
+
+	//process header
+	msgFromResolver.Header.QR = 1
+	msgFromResolver.Header.AA = 0
+	msgFromResolver.Header.TC = 0
+	msgFromResolver.Header.RA = 0
+	msgFromResolver.Header.QDCOUNT = uint16(len(msgFromResolver.Question))
+	msgFromResolver.Header.ANCOUNT = uint16(len(msgFromResolver.Answer))
+
+	if msgFromResolver.Header.OPCODE == 0 {
+		msgFromResolver.Header.RCODE = 0
+	} else {
+		msgFromResolver.Header.RCODE = 4
+	}
+	return msgFromResolver, nil
+}
+
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here!")
+	var resolver string
+	var remoteServerAddr *net.UDPAddr
+	var remoteServerConn *net.UDPConn
+
+	flag.StringVar(&resolver, "resolver", "", "resolver")
+	flag.Parse()
 
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
 		fmt.Println("Failed to resolve UDP address:", err)
 		return
+	}
+	resolverIsUsed := resolver != ""
+
+	if resolverIsUsed {
+		fmt.Println("Resolver is used: ", resolver)
+		remoteServerAddr, err = net.ResolveUDPAddr("udp", resolver)
+		if err != nil {
+			fmt.Println("Failed to resolve remote server address:", err)
+		}
+
+		remoteServerConn, err = net.DialUDP("udp", nil, remoteServerAddr)
+		if err != nil {
+			fmt.Println("Failed to connect to remote server:", err)
+		}
+
+		defer remoteServerConn.Close()
+
+		fmt.Println("Connected to resolver")
 	}
 
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -320,23 +427,32 @@ func main() {
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 
 		dataReader := bytes.NewReader(buf[:size])
-		parsedData, err := ParseDNSMessage(dataReader)
+		query, err := ParseDNSMessage(dataReader)
 		if err != nil {
 			fmt.Println("error while parsing DNS message ", err)
 			continue
 		}
 
-		exampleMessage, err := CreateDNSMessage(&parsedData)
-		if err != nil {
-			fmt.Println("Failed to create DNS message: ", err)
+		var response DNSMessage
+		if resolverIsUsed {
+			response, err = ResolveQueryWithForwarder(remoteServerConn, &query)
+			if err != nil {
+				fmt.Println("Failed to get DNS message from remote server: ", err)
+			}
+
+		} else {
+			response, err = CreateDummyDNSResponse(&query)
+			if err != nil {
+				fmt.Println("Failed to create dummy DNS message: ", err)
+			}
 		}
 
-		receivedMessage, err := exampleMessage.Serialize()
+		serializedResponse, err := response.Serialize()
 		if err != nil {
 			fmt.Println("Failed to serialize message: ", err)
 		}
 
-		_, err = udpConn.WriteToUDP(receivedMessage, source)
+		_, err = udpConn.WriteToUDP(serializedResponse, source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
